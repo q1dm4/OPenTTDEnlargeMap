@@ -1,0 +1,5 @@
+Copy the four TAR files used by your original Sadingham game here. Do not extract them.
+1560b248-redFISH-0.4.tar
+f1250009-FIRS_Industries_5-5.2.0.tar
+43411223-Iron_Horse_4_Trains-4.16.0.tar
+52444345-Temporal8_Real_Houses_Townset-1.2.1.tar

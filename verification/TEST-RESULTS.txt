@@ -1,0 +1,19 @@
+OpenTTD Map Utility 0.1 checks — 2026-10-13
+
+PASS: Sadingham reader metadata: 2048 x 2048, 1352 towns, 6401 industries.
+PASS: zlib, LZMA/XZ, uncompressed wrappers.
+PASS: spaced and Unicode filenames.
+PASS: damaged header, truncated compression, invalid chunks/dimensions and unsupported zstd rejected.
+PASS: PowerShell native parser on launcher and GUI scripts.
+PASS: basic launcher self-test, including original 1024-square Sadingham density proposal (1014 towns, 5115 industries).
+PASS: rectangular enlargement proposals and size limits.
+PASS: PowerShell process execution/captured reader JSON.
+PASS: generated engine console script paths and UTF8 without BOM.
+PASS: correct patched engine hash accepted; different executable rejected.
+PASS: output copy equality and CreateNew overwrite protection.
+PASS: Windows x64 console reader build and Windows system/UCRT-only DLL imports.
+PASS: corrected full engine source patch applies to official JGRPP 0.73.0 base.
+PASS: corrected population source and all four integration files pass GCC C++20 syntax checks with engine build flags.
+
+NOT RUN HERE: Windows Forms visual/runtime test and the complete new launcher-to-Windows-engine workflow.
+The existing engine was retained unchanged; its expansion/population tests are documented in the earlier v0.2 package.

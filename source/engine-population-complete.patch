@@ -1,0 +1,1614 @@
+diff --git a/src/3rdparty/fmt/format.cc b/src/3rdparty/fmt/format.cc
+--- a/src/3rdparty/fmt/format.cc
++++ b/src/3rdparty/fmt/format.cc
+@@ -1,3 +1,4 @@
++#include <cstdlib> // Required before fmt headers with LLVM MinGW UCRT.
+ // Formatting library for C++
+ //
+ // Copyright (c) 2012 - 2016, Victor Zverovich
+diff --git a/src/3rdparty/fmt/os.cc b/src/3rdparty/fmt/os.cc
+--- a/src/3rdparty/fmt/os.cc
++++ b/src/3rdparty/fmt/os.cc
+@@ -1,3 +1,4 @@
++#include <cstdlib> // Required before fmt headers with LLVM MinGW UCRT.
+ // Formatting library for C++ - optional OS-specific functionality
+ //
+ // Copyright (c) 2012 - 2016, Victor Zverovich
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -52,6 +52,9 @@
+ )
+ 
+ add_files(
++    teleport_gateway.cpp
++    teleport_gateway.h
++    teleport_gateway_policy.h
+     aircraft.h
+     aircraft_cmd.cpp
+     aircraft_gui.cpp
+@@ -680,3 +683,5 @@
+     zoning_cmd.cpp
+     zoning_gui.cpp
+ )
++
++add_files(map_expansion.cpp map_expansion.h map_population.cpp map_population.h)
+diff --git a/src/base_station_base.h b/src/base_station_base.h
+--- a/src/base_station_base.h
++++ b/src/base_station_base.h
+@@ -73,6 +73,12 @@
+ 	StringID string_id = INVALID_STRING_ID; ///< Default name (town area) of station
+ 
+ 	CalTime::Date build_date{};             ///< Date of construction
++
++	/** Persistent gateway pairing. Old saves default to an unregistered endpoint. */
++	TileIndex teleport_gateway_anchor = INVALID_TILE;
++	uint64_t teleport_gateway_sequence = 0;
++	uint16_t teleport_gateway_partner = 0xFFFF;
++	uint64_t teleport_gateway_partner_sequence = 0;
+ 
+ 	Town *town = nullptr;                   ///< The town this station is associated with
+ 
+diff --git a/src/command.cpp b/src/command.cpp
+--- a/src/command.cpp
++++ b/src/command.cpp
+@@ -8,6 +8,7 @@
+ /** @file command.cpp Handling of commands. */
+ 
+ #include "stdafx.h"
++#include "map_population.h"
+ #include "landscape.h"
+ #include "error.h"
+ #include "gui.h"
+@@ -274,6 +275,7 @@
+ #endif
+ 
+ 	assert(IsValidCommand(cmd));
++	if (_populating_expansion && (cmd == Commands::TerraformLand || (tile != 0 && !IsExpansionPopulationTile(tile)))) return CMD_ERROR;
+ 
+ 	if ((intl_flags & DCIF_TYPE_CHECKED) == 0) {
+ 		if (!IsCorrectCommandPayloadType(cmd, payload)) return CMD_ERROR;
+diff --git a/src/console_cmds.cpp b/src/console_cmds.cpp
+--- a/src/console_cmds.cpp
++++ b/src/console_cmds.cpp
+@@ -8,6 +8,18 @@
+ /** @file console_cmds.cpp Implementation of the console hooks. */
+ 
+ #include "stdafx.h"
++#include "map_population.h"
++#include "teleport_gateway.h"
++#include "signal_func.h"
++#include "train.h"
++#include "company_cmd.h"
++#include "newgrf_station.h"
++#include "rail_cmd.h"
++#include "station_cmd.h"
++#include "vehicle_cmd.h"
++#include "train_cmd.h"
++#include "order_cmd.h"
++#include "scope.h"
+ #include "core/string_consumer.hpp"
+ #include "console_internal.h"
+ #include "crashlog.h"
+@@ -23,6 +35,7 @@
+ #include "network/network_client.h"
+ #include "network/network_server.h"
+ #include "command_func.h"
++#include "pbs.h"
+ #include "command_log.h"
+ #include "settings_func.h"
+ #include "fios.h"
+@@ -510,6 +523,46 @@
+  * Save the map to a file.
+  * @copydoc IConsoleCmdProc
+  */
++static bool ConPopulateExpansion(std::span<std::string_view> argv)
++{
++    if (argv.empty()) { IConsolePrint(CC_HELP, "Usage: populate_expansion <original-width> <original-height> <towns> <industries> <new-save-name>. Adds population in this session and writes a separate save."); return true; }
++    if (argv.size() != 6) return false;
++    const auto w = ParseInteger(argv[1]), h = ParseInteger(argv[2]), t = ParseInteger(argv[3]), n = ParseInteger(argv[4]);
++    if (!w || !h || !t || !n) return false;
++    std::string report;
++    const bool ok = PopulateExpandedMap(*w, *h, *t, *n, fmt::format("{}.sav", argv[5]), report);
++    IConsolePrint(ok ? CC_INFO : CC_ERROR, "{}", report);
++    return true;
++}
++
++static bool ConExpandMap(std::span<std::string_view> argv)
++{
++    if (argv.empty()) { IConsolePrint(CC_HELP, "Export a larger empty-land copy. Usage: expand_map <width> <height> <new-save-name>"); return true; }
++    if (argv.size() != 4) return false;
++    auto w = ParseInteger(argv[1]), h = ParseInteger(argv[2]);
++    if (!w || !h) return false;
++    std::string error;
++    if (!ExportExpandedMap(*w, *h, fmt::format("{}.sav", argv[3]), error)) IConsolePrint(CC_ERROR, "{}", error);
++    else IConsolePrint(CC_INFO, "Expanded copy exported. Load the new save to use it. Original running map is unchanged.");
++    return true;
++}
++#ifdef DEDICATED
++// Headless diagnostic equivalent of accepting the native unsafe-unpause dialog.
++// Used only on disposable validation copies; not compiled into the Windows GUI.
++static bool ConMapTestResume(std::span<std::string_view> argv)
++{
++    if (argv.size() != 2 || argv[1] != "acknowledge-grf-warning" || _networking) return false;
++    Command<Commands::Pause>::Do(DoCommandFlag::Execute, PauseMode::Error, false);
++    Command<Commands::Pause>::Do(DoCommandFlag::Execute, PauseMode::Normal, false);
++    IConsolePrint(CC_WARNING, "Diagnostic copy resumed after acknowledging the existing NewGRF warning.");
++    return true;
++}
++#endif
++static bool ConMapReport(std::span<std::string_view> argv)
++{
++    IConsolePrint(CC_INFO, "{}", GetMapExpansionReport()); return true;
++}
++
+ static bool ConSave(std::span<std::string_view> argv)
+ {
+ 	if (argv.empty()) {
+@@ -4441,8 +4494,175 @@
+ }
+ 
+ /** Console command registration. */
++/** Read-only diagnostic for the gateway pairing development build. */
++static bool ConGatewayPairs(std::span<std::string_view> argv)
++{
++    if (argv.empty()) {
++        IConsolePrint(CC_HELP, "List gateway pair identities. Usage: gateway_pairs");
++        return true;
++    }
++    if (argv.size() != 1) return false;
++    uint count = 0;
++    for (const Station *station : Station::Iterate()) {
++        if (station->teleport_gateway_anchor == INVALID_TILE) continue;
++        ++count;
++        IConsolePrint(CC_DEFAULT, "Gateway station {} tile {} owner {} sequence {} partner {} (65535 = unpaired)",
++            station->index.base(), station->teleport_gateway_anchor.base(), station->owner.base(),
++            station->teleport_gateway_sequence, station->teleport_gateway_partner);
++    }
++    IConsolePrint(CC_DEFAULT, "{} gateway endpoints. Restricted prototype: same-axis straight corridors and classic braking only.", count);
++    return true;
++}
++
++/** Development-only fixture. Runs native construction commands in an empty,
++ * flat single-player map. Refuses games containing any stations or vehicles. */
++static bool ConGatewayDemo(std::span<std::string_view> argv)
++{
++    if (argv.empty()) { IConsolePrint(CC_HELP, "Build the restricted gateway test layout in an empty flat game. Usage: gateway_demo"); return true; }
++    if (argv.size() > 2 || (argv.size() == 2 && argv[1] != "y")) return false;
++    const bool axis_y = argv.size() == 2;
++    const Axis axis = axis_y ? Axis::Y : Axis::X;
++    const Track track = AxisToTrack(axis);
++    auto tile_xy = [axis_y](uint x, uint y) { return axis_y ? TileXY(y, x) : TileXY(x, y); };
++    if (_networking || _game_mode != GameMode::Normal || Station::GetNumItems() != 0 ||
++            Map::SizeX() < 128 || Map::SizeY() < 128) {
++        IConsolePrint(CC_ERROR, "gateway_demo requires an empty flat 128x128 single-player test game. Network {}, mode {}, stations {}, vehicles {}, map {}x{}", _networking, static_cast<uint>(_game_mode), Station::GetNumItems(), Vehicle::GetNumItems(), Map::SizeX(), Map::SizeY()); return true;
++    }
++    for (const Vehicle *vehicle : Vehicle::Iterate()) {
++        if (vehicle->type <= VehicleType::Aircraft) { IConsolePrint(CC_ERROR, "The demo requires a game with no player vehicles."); return true; }
++    }
++    StationClassID gateway_class{}; uint16_t gateway_spec = 0; bool found = false;
++    for (const auto &cls : StationClass::Classes()) for (uint i = 0; i < cls.GetSpecCount(); ++i) {
++        const auto *spec = cls.GetSpec(i);
++        if (spec != nullptr && spec->grf_prop.grfid == TELEPORT_GATEWAY_GRFID && spec->grf_prop.local_id == 0) {
++            gateway_class = cls.Index(); gateway_spec = i; found = true;
++        }
++    }
++    if (!found) { IConsolePrint(CC_ERROR, "Activate the gateway NewGRF before starting this test game."); return true; }
++    // Preflight all terrain before performing any construction.
++    for (uint y : {40U, 90U}) for (uint x = (y == 40 ? 20 : 65); x <= (y == 40 ? 58 : 106); ++x) {
++        TileIndex tile = tile_xy(x, y);
++        if (GetTileSlope(tile) != SLOPE_FLAT ||
++                !(IsTileType(tile, TileType::Clear) || IsTileType(tile, TileType::Trees)) ||
++                TileHeight(tile) != TileHeight(tile_xy(y == 40 ? 20 : 65, y))) {
++            IConsolePrint(CC_ERROR, "Test lane blocked at {},{}: type {}, slope {}, height {}, reference {}", x, y, static_cast<uint>(GetTileType(tile)), static_cast<uint>(GetTileSlope(tile)), TileHeight(tile), TileHeight(tile_xy(20,y))); return true;
++        }
++    }
++    if (!Company::IsValidID(_local_company)) {
++        if (Company::GetNumItems() != 0) { IConsolePrint(CC_ERROR, "Select a local test company."); return true; }
++        DoStartupNewCompany(DSNC_NONE);
++        SetLocalCompany(CompanyID::Begin());
++    }
++    const CompanyID old_company = _current_company;
++    _current_company = _local_company;
++    auto restore_company = scope_guard([&]() { _current_company = old_company; });
++    Company::Get(_current_company)->money = 1000000000; // Empty test game only.
++    _settings_game.vehicle.train_braking_model = TBM_ORIGINAL;
++    auto check = [&](const CommandCost &cost, const char *step) {
++        if (cost.Failed()) IConsolePrint(CC_ERROR, "gateway_demo failed at {}", step);
++        return cost.Succeeded();
++    };
++    const auto flags = DoCommandFlag::Execute;
++    const RailType rt = RAILTYPE_RAIL;
++    for (uint x = 20; x < 58; ++x) if (!check(Command<Commands::BuildRail>::Do(flags, tile_xy(x,40), rt, track, BuildRailTrackFlags::None), "source rail")) return true;
++    for (uint x = 65; x <= 106; ++x) if (!check(Command<Commands::BuildRail>::Do(flags, tile_xy(x,90), rt, track, BuildRailTrackFlags::None), "destination rail")) return true;
++    if (!check(Command<Commands::BuildRailStation>::Do(flags, tile_xy(36,40), rt, axis, 1, 1, gateway_class, gateway_spec, NEW_STATION, true), "gateway A")) return true;
++    if (!check(Command<Commands::BuildRailStation>::Do(flags, tile_xy(90,90), rt, axis, 1, 1, gateway_class, gateway_spec, NEW_STATION, true), "gateway B")) return true;
++    if (!check(Command<Commands::BuildRailStation>::Do(flags, tile_xy(52,40), rt, axis, 1, 4, StationClassID{0}, 0, NEW_STATION, true), "ordinary source station")) return true;
++    if (!check(Command<Commands::BuildRailStation>::Do(flags, tile_xy(70,90), rt, axis, 1, 4, StationClassID{0}, 0, NEW_STATION, true), "ordinary destination station")) return true;
++    TileIndex depot = tile_xy(58,40);
++    if (!check(Command<Commands::BuildRailDepot>::Do(flags, depot, rt, axis_y ? DiagDirection::NW : DiagDirection::NE), "depot")) return true;
++    auto built = Command<Commands::BuildVehicle>::Do(flags, depot, EngineID{0}, false, INVALID_CARGO, CLIENT_ID_SERVER);
++    if (!check(built, "locomotive")) return true;
++    auto id = built.GetResultData<VehicleID>();
++    if (!id.has_value()) { IConsolePrint(CC_ERROR, "No locomotive result ID"); return true; }
++    for (int n = 0; n < 2; ++n) {
++        auto wagon = Command<Commands::BuildVehicle>::Do(flags, depot, EngineID{29}, false, INVALID_CARGO, CLIENT_ID_SERVER);
++        if (!check(wagon, "coal wagon")) return true;
++        auto wagon_id = wagon.GetResultData<VehicleID>();
++        if (!wagon_id.has_value() || !check(Command<Commands::MoveRailVehicle>::Do(flags, *wagon_id, Train::Get(*id)->Last()->index, MoveRailVehicleFlags::None), "attach wagon")) return true;
++        if (n == 0) Train::Get(*wagon_id)->cargo.Append(CargoPacket::Create(static_cast<uint16_t>(7), static_cast<uint16_t>(0), GetStationIndex(tile_xy(52,40)), tile_xy(52,40), Money{0}));
++    }
++    Train::Get(*id)->CargoChanged();
++    for (uint i = 0; i < 2; ++i) {
++        Order order; order.MakeGoToStation(GetStationIndex(i == 0 ? tile_xy(70,90) : tile_xy(52,40)));
++        order.SetNonStopType(ONSF_NO_STOP_AT_INTERMEDIATE_STATIONS);
++        if (!check(DoCommand<Commands::InsertOrder>(InsertOrderCmdData(*id, static_cast<VehicleOrderID>(i), order), flags), "train order")) return true;
++    }
++    if (!check(Command<Commands::StartStopVehicle>::Do(flags, *id, false), "start train")) return true;
++    IConsolePrint(CC_INFO, "Gateway demo built. Train {}: ordinary station -> gateway -> remote ordinary station. Classic braking only.", id->base());
++    return true;
++}
++
++static bool ConGatewayStatus(std::span<std::string_view> argv)
++{
++    if (argv.empty()) { IConsolePrint(CC_HELP, "Print train positions and gateway passage counters. Usage: gateway_status"); return true; }
++    if (argv.size() != 1) return false;
++    for (const Train *train : Train::Iterate()) {
++        if (!train->IsFrontEngine()) continue;
++        uint parts = 0, cargo = 0;
++        for (const Train *u = train; u != nullptr; u = u->Next()) { ++parts; cargo += u->cargo.StoredCount(); }
++        IConsolePrint(CC_DEFAULT, "Train {} tile {} passages {} parts {} cargo {} orders {} speed {} exit {}",
++            train->index.base(), train->tile.base(), train->teleport_gateway_passages, parts, cargo,
++            train->GetNumOrders(), train->cur_speed, train->teleport_gateway_exit.base());
++    }
++    return true;
++}
++
++/** Test-only exit obstruction control for the exact demo layout. */
++static bool ConGatewayTestBlock(std::span<std::string_view> argv)
++{
++    if (argv.empty()) { IConsolePrint(CC_HELP, "Obstruct the demo exit. Usage: gateway_test_block on|vehicle|off"); return true; }
++    if (argv.size() != 2) return false;
++    const TileIndex target = TileXY(90,90), depot = TileXY(58,40);
++    if (_networking || _game_mode != GameMode::Normal || Map::SizeX() != 128 || Map::SizeY() != 128 ||
++            Station::GetNumItems() != 4 || !IsTeleportGatewayTile(target) || GetRailStationAxis(target) != Axis::X || !IsRailDepotTile(depot) || !Company::IsValidID(_local_company)) {
++        IConsolePrint(CC_ERROR, "Obstruction controls are restricted to the demo layout."); return true;
++    }
++    const CompanyID old_company = _current_company; _current_company = _local_company;
++    auto restore = scope_guard([&]() { _current_company = old_company; });
++    if (argv[1] == "on") {
++        if (!TryReserveRailTrack(target, TRACK_X)) { IConsolePrint(CC_ERROR, "Demo exit is already reserved."); return true; }
++        IConsolePrint(CC_INFO, "Demo gateway exit reserved for obstruction test.");
++    } else if (argv[1] == "vehicle") {
++        auto built = Command<Commands::BuildVehicle>::Do(DoCommandFlag::Execute, depot, EngineID{0}, false, INVALID_CARGO, CLIENT_ID_SERVER);
++        auto id = built.GetResultData<VehicleID>();
++        if (built.Failed() || !id.has_value()) { IConsolePrint(CC_ERROR, "Could not create the stopped obstruction train."); return true; }
++        Train *train = Train::Get(*id);
++        train->tile = target; train->track = TRACK_BIT_X;
++        train->x_pos = TileX(target) * TILE_SIZE + 8; train->y_pos = TileY(target) * TILE_SIZE + 8;
++        train->z_pos = GetSlopePixelZ(train->x_pos, train->y_pos, true);
++        train->SetMovingDirection(Direction::NE); train->vehstatus.Reset(VehState::Hidden);
++        train->UpdatePosition(); train->UpdateInclination(true, false, false);
++        train->ConsistChanged(CCF_TRACK); train->MarkDirty();
++        TryReserveRailTrack(target, TRACK_X);
++        IConsolePrint(CC_INFO, "Stopped obstruction train {} placed on the demo gateway exit.", id->base());
++    } else if (argv[1] == "off") {
++        for (Train *train : Train::Iterate()) {
++            if (!train->IsFrontEngine() || train->tile != target || !train->vehstatus.Test(VehState::Stopped) || train->Next() != nullptr) continue;
++            const VehicleID id = train->index;
++            train->tile = depot; train->track = TRACK_BIT_DEPOT;
++            train->x_pos = TileX(depot) * TILE_SIZE + 8; train->y_pos = TileY(depot) * TILE_SIZE + 8;
++            train->z_pos = GetSlopePixelZ(train->x_pos, train->y_pos, true); train->vehstatus.Set(VehState::Hidden);
++            train->UpdatePosition(); train->UpdateInclination(true, false, false);
++            auto result = Command<Commands::SellVehicle>::Do(DoCommandFlag::Execute, depot, id, SellVehicleFlags::SellChain, CLIENT_ID_SERVER);
++            if (result.Failed()) { IConsolePrint(CC_ERROR, "Could not remove the test obstruction train."); return true; }
++            break;
++        }
++        UnreserveRailTrack(target, TRACK_X);
++        IConsolePrint(CC_INFO, "Demo gateway exit obstruction removed.");
++    } else return false;
++    UpdateSignalsOnSegment(target, DiagDirection::NE, _current_company);
++    UpdateSignalsOnSegment(target, DiagDirection::SW, _current_company);
++    return true;
++}
++
+ void IConsoleStdLibRegister()
+ {
++	IConsole::CmdRegister("gateway_test_block", ConGatewayTestBlock);
++	IConsole::CmdRegister("gateway_demo", ConGatewayDemo);
++	IConsole::CmdRegister("gateway_status", ConGatewayStatus);
++	IConsole::CmdRegister("gateway_pairs", ConGatewayPairs);
+ 	IConsole::CmdRegister("debug_level",             ConDebugLevel);
+ 	IConsole::CmdRegister("echo",                    ConEcho);
+ 	IConsole::CmdRegister("echoc",                   ConEchoC);
+@@ -4477,6 +4697,12 @@
+ 	IConsole::CmdRegister("load_scenario",           ConLoadScenario);
+ 	IConsole::CmdRegister("load_heightmap",          ConLoadHeightmap);
+ 	IConsole::CmdRegister("rm",                      ConRemove);
++	IConsole::CmdRegister("populate_expansion", ConPopulateExpansion);
++	IConsole::CmdRegister("expand_map", ConExpandMap);
++	IConsole::CmdRegister("map_report", ConMapReport);
++#ifdef DEDICATED
++	IConsole::CmdRegister("map_test_resume", ConMapTestResume);
++#endif
+ 	IConsole::CmdRegister("save",                    ConSave);
+ 	IConsole::CmdRegister("saveconfig",              ConSaveConfig);
+ 	IConsole::CmdRegister("ls",                      ConListFiles);
+diff --git a/src/industry_cmd.cpp b/src/industry_cmd.cpp
+--- a/src/industry_cmd.cpp
++++ b/src/industry_cmd.cpp
+@@ -8,6 +8,7 @@
+ /** @file industry_cmd.cpp Handling of industry tiles. */
+ 
+ #include "stdafx.h"
++#include "map_population.h"
+ #include "misc/history_type.hpp"
+ #include "misc/history_func.hpp"
+ #include "clear_map.h"
+@@ -1106,6 +1107,7 @@
+ 	ta.ClampToMap();
+ 
+ 	if (ta.w == 0 || ta.h == 0) return;
++	for (TileIndex cur_tile : ta) if (!IsExpansionPopulationTile(cur_tile)) return;
+ 
+ 	/* check the amount of bad tiles */
+ 	int count = 0;
+@@ -1522,7 +1524,7 @@
+ 		IndustryGfx gfx = GetTranslatedIndustryTileID(it.gfx);
+ 		TileIndex cur_tile = TileAddWrap(tile, it.ti.x, it.ti.y);
+ 
+-		if (!IsValidTile(cur_tile)) {
++		if (!IsValidTile(cur_tile) || !IsExpansionPopulationTile(cur_tile)) {
+ 			return CommandCost(STR_ERROR_SITE_UNSUITABLE);
+ 		}
+ 
+@@ -1703,6 +1705,7 @@
+ 
+ 	for (TileIndex tile_walk : ta) {
+ 		uint curh = TileHeight(tile_walk);
++		if (_populating_expansion && (!IsExpansionPopulationTile(tile_walk) || curh != h)) return false;
+ 		if (curh != h) {
+ 			/* This tile needs terraforming. Check if we can do that without
+ 			 *  damaging the surroundings too much. */
+@@ -3422,3 +3425,27 @@
+ 	}
+ 	ind->produced_cargo_count = produced_cargo_count;
+ }
++
++uint GenerateExpansionIndustries(uint count)
++{
++    std::array<uint32_t, NUM_INDUSTRYTYPES> probabilities{};
++    uint32_t total = 0;
++    for (IndustryType type = 0; type < NUM_INDUSTRYTYPES; ++type) {
++        bool forced = false;
++        probabilities[type] = GetScaledIndustryGenerationProbability(type, false, &forced);
++        total += probabilities[type];
++    }
++    if (total == 0) return 0;
++    uint made = 0;
++    for (uint i = 0; i < count; ++i) {
++        uint32_t r = RandomRange(total);
++        IndustryType type = 0;
++        while (r >= probabilities[type]) { r -= probabilities[type]; ++type; }
++        for (uint attempt = 0; attempt < 400; ++attempt) {
++            TileIndex tile = RandomExpansionPopulationTile();
++            if (tile == INVALID_TILE) break;
++            if (CreateNewIndustry(tile, type, IndustryAvailabilityCallType::MapGeneration) != nullptr) { ++made; break; }
++        }
++    }
++    return made;
++}
+diff --git a/src/map_expansion.cpp b/src/map_expansion.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/map_expansion.cpp
+@@ -0,0 +1,102 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include "stdafx.h"
++#include "map_expansion.h"
++#include "map_func.h"
++#include "tile_map.h"
++#include "company_base.h"
++#include "town.h"
++#include "industry.h"
++#include "station_base.h"
++#include "vehicle_base.h"
++#include "order_base.h"
++#include "cargopacket.h"
++#include "depot_base.h"
++#include "tunnel_base.h"
++#include "game/game.hpp"
++#include "network/network.h"
++#include "sl/saveload.h"
++#include "sl/saveload_buffer.h"
++#include "scope.h"
++#include "fileio_func.h"
++#include "safeguards.h"
++
++uint32_t _map_expansion_width = 0;
++uint32_t _map_expansion_height = 0;
++
++uint32_t RemapExpansionTile(uint32_t tile)
++{
++    if (_map_expansion_width == 0 || tile == UINT32_MAX) return tile;
++    if (tile >= Map::Size()) SlErrorCorruptFmt("Expansion encountered out-of-range tile {}", tile);
++    return (tile / Map::SizeX()) * _map_expansion_width + tile % Map::SizeX();
++}
++
++bool ExportExpandedMap(uint32_t width, uint32_t height, const std::string &filename, std::string &error)
++{
++    if (_networking || _game_mode != GameMode::Normal) { error = "Expansion requires a single-player game."; return false; }
++    if (!ValidateMapSize(width, height) || width < Map::SizeX() || height < Map::SizeY() || (width == Map::SizeX() && height == Map::SizeY())) {
++        error = "Use valid larger map dimensions; shrinking is not supported."; return false;
++    }
++    if (Game::GetInstance() != nullptr) { error = "GameScript state may contain opaque tile numbers; expansion is not supported for this save."; return false; }
++    for (const Company *company : Company::Iterate()) if (company->is_ai) {
++        error = "AI state may contain opaque tile numbers; expansion is not supported for this save."; return false;
++    }
++    if (FioCheckFileExists(filename, Subdirectory::Save)) { error = "Output already exists. Choose a new save name; existing files are never overwritten."; return false; }
++    for (const Vehicle *v : Vehicle::Iterate()) if (v->type == VehicleType::Disaster) { error = "Active disaster state uses overloaded tile references; wait until the disaster ends before expanding."; return false; }
++    WaitTillSaved();
++    _map_expansion_width = width;
++    _map_expansion_height = height;
++    auto restore = scope_guard([] { _map_expansion_width = 0; _map_expansion_height = 0; });
++    const auto result = SaveOrLoad(filename, SaveLoadOperation::Save, DetailedFileType::GameFile, Subdirectory::Save, false);
++    if (result != SaveLoadResult::Ok) { error = "Expanded save export failed."; return false; }
++    return true;
++}
++
++void WriteExpandedMapTiles()
++{
++    const uint32_t width = _map_expansion_width, height = _map_expansion_height;
++    const uint32_t size = width * height;
++    std::vector<Tile> tiles(size);
++    std::vector<TileExtended> extended(size);
++    for (uint32_t y = 0; y < height; ++y) for (uint32_t x = 0; x < width; ++x) {
++        const uint32_t index = y * width + x;
++        Tile &tile = tiles[index];
++        if (x < Map::SizeX() && y < Map::SizeY()) {
++            const TileIndex old{y * Map::SizeX() + x};
++            tile = _m[old]; extended[index] = _me[old];
++            if (!IsTileType(old, TileType::Void) || (x != Map::MaxX() && y != Map::MaxY())) continue;
++            if (_settings_game.construction.freeform_edges && (x == 0 || y == 0)) continue;
++            // The old east/south void border becomes a shoreline at height zero.
++            tile = {}; extended[index] = {};
++            tile.m1 = OWNER_NONE.base(); tile.m5 = 3;
++            continue;
++        }
++        tile.height = 1; tile.m1 = OWNER_NONE.base(); tile.m5 = 3;
++        if (x == width - 1 || y == height - 1 || (_settings_game.construction.freeform_edges && (x == 0 || y == 0))) {
++            tile = {}; tile.type = to_underlying(TileType::Void) << 4;
++        }
++    }
++    static_assert(std::endian::native == std::endian::little);
++    SlSetLength(size * 12);
++    auto *dumper = MemoryDumper::GetCurrent();
++    dumper->CopyBytes(reinterpret_cast<uint8_t *>(tiles.data()), size * sizeof(Tile));
++    dumper->CopyBytes(reinterpret_cast<uint8_t *>(extended.data()), size * sizeof(TileExtended));
++}
++
++std::string GetMapExpansionReport()
++{
++    uint64_t cargo = 0;
++    for (const Vehicle *v : Vehicle::Iterate()) if (v->type <= VehicleType::Aircraft) cargo += v->cargo.StoredCount();
++    uint64_t hash = 1469598103934665603ULL, packet_cargo = 0;
++    auto mix = [&](uint64_t value) { hash ^= value; hash *= 1099511628211ULL; };
++    auto tile = [&](TileIndex t) { if (t == INVALID_TILE) { mix(UINT32_MAX); mix(UINT32_MAX); } else { mix(TileX(t)); mix(TileY(t)); } };
++    for (const Town *v : Town::Iterate()) { mix(1); mix(v->index.base()); tile(v->xy); }
++    for (const BaseStation *v : BaseStation::Iterate()) { mix(2); mix(v->index.base()); tile(v->xy); }
++    for (const Industry *v : Industry::Iterate()) { mix(3); mix(v->index.base()); tile(v->location.tile); }
++    for (const Depot *v : Depot::Iterate()) { mix(4); mix(v->index.base()); tile(v->xy); }
++    for (const Tunnel *v : Tunnel::Iterate()) { mix(5); mix(v->index.base()); tile(v->tile_n); tile(v->tile_s); }
++    for (const Vehicle *v : Vehicle::Iterate()) { mix(6); mix(v->index.base()); tile(v->tile); mix(v->x_pos); mix(v->y_pos); if (v->type <= VehicleType::Aircraft) tile(v->dest_tile); }
++    for (const CargoPacket *p : CargoPacket::Iterate()) packet_cargo += p->Count();
++    return fmt::format("Map {}x{}; companies {}; towns {}; industries {}; stations {}; vehicles {}; order lists {}; cargo packets {}; stored cargo {}; total packet cargo {}; coordinate fingerprint {:016x}",
++        Map::SizeX(), Map::SizeY(), Company::GetNumItems(), Town::GetNumItems(), Industry::GetNumItems(), BaseStation::GetNumItems(),
++        Vehicle::GetNumItems(), OrderList::GetNumItems(), CargoPacket::GetNumItems(), cargo, packet_cargo, hash);
++}
+diff --git a/src/map_expansion.h b/src/map_expansion.h
+new file mode 100644
+--- /dev/null
++++ b/src/map_expansion.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef MAP_EXPANSION_H
++#define MAP_EXPANSION_H
++#include "tile_type.h"
++#include <string>
++#include <type_traits>
++
++extern uint32_t _map_expansion_width;
++extern uint32_t _map_expansion_height;
++uint32_t RemapExpansionTile(uint32_t tile);
++bool ExportExpandedMap(uint32_t width, uint32_t height, const std::string &filename, std::string &error);
++void WriteExpandedMapTiles();
++std::string GetMapExpansionReport();
++
++template <typename T> constexpr uint32_t MapExpansionTileFlag()
++{
++    using U = std::remove_cvref_t<T>;
++    if constexpr (std::is_same_v<U, TileIndex>) return 1U << 12;
++    else if constexpr (std::is_array_v<U>) return MapExpansionTileFlag<std::remove_extent_t<U>>();
++    else if constexpr (requires { typename U::value_type; }) return MapExpansionTileFlag<typename U::value_type>();
++    else return 0;
++}
++#endif
+diff --git a/src/map_population.cpp b/src/map_population.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/map_population.cpp
+@@ -0,0 +1,83 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include "stdafx.h"
++#include "map_population.h"
++#include "map_func.h"
++#include "tile_map.h"
++#include "town.h"
++#include "industry.h"
++#include "company_base.h"
++#include "company_func.h"
++#include "network/network.h"
++#include "game/game.hpp"
++#include "core/random_func.hpp"
++#include "core/backup_type.hpp"
++#include "genworld.h"
++#include "fileio_func.h"
++#include "sl/saveload.h"
++#include "scope.h"
++#include "safeguards.h"
++
++bool _populating_expansion = false;
++static uint _population_old_width, _population_old_height;
++
++bool IsExpansionPopulationTile(TileIndex tile)
++{
++    if (!_populating_expansion) return true;
++    if (tile >= Map::Size() || !IsValidTile(tile)) return false;
++    const uint x = TileX(tile), y = TileY(tile);
++    // Leave an untouched strip beside the old map and the external boundary.
++    return x >= 16 && y >= 16 && x + 16 < Map::MaxX() && y + 16 < Map::MaxY() &&
++        (x >= _population_old_width + 16 || y >= _population_old_height + 16);
++}
++
++TileIndex RandomExpansionPopulationTile()
++{
++    for (uint tries = 0; tries < 10000; ++tries) {
++        TileIndex tile = RandomTile();
++        if (IsExpansionPopulationTile(tile)) return tile;
++    }
++    return INVALID_TILE;
++}
++
++static uint64_t OriginalTileChecksum(uint w, uint h)
++{
++    uint64_t hash = 14695981039346656037ULL;
++    auto add = [&](const auto &value) {
++        const uint8_t *p = reinterpret_cast<const uint8_t *>(&value);
++        for (size_t i = 0; i < sizeof(value); ++i) hash = (hash ^ p[i]) * 1099511628211ULL;
++    };
++    for (uint y = 0; y < h; ++y) for (uint x = 0; x < w; ++x) {
++        TileIndex t = TileXY(x, y); add(_m[t]); add(_me[t]);
++    }
++    return hash;
++}
++
++bool PopulateExpandedMap(uint old_width, uint old_height, uint towns, uint industries, const std::string &filename, std::string &report)
++{
++    if (_networking || _game_mode != GameMode::Normal || _populating_expansion) { report = "Requires a single-player game."; return false; }
++    if (old_width < 64 || old_height < 64 || old_width > Map::SizeX() || old_height > Map::SizeY() ||
++        (old_width == Map::SizeX() && old_height == Map::SizeY()) || towns > 2000 || industries > 10000 || towns + industries == 0) {
++        report = "Invalid original dimensions or counts (maximum 2000 towns, 10000 industries)."; return false;
++    }
++    if (Game::GetInstance() != nullptr) { report = "GameScript saves are not supported."; return false; }
++    for (const Company *c : Company::Iterate()) if (c->is_ai) { report = "AI saves are not supported."; return false; }
++    if (FioCheckFileExists(filename, Subdirectory::Save)) { report = "Output exists; choose a new save name."; return false; }
++    WaitTillSaved();
++    const uint64_t before = OriginalTileChecksum(old_width, old_height);
++    _population_old_width = old_width; _population_old_height = old_height;
++    uint made_towns, made_industries;
++    {
++        AutoRestoreBackup active(_populating_expansion, true);
++        AutoRestoreBackup generating(_generating_world, true);
++        AutoRestoreBackup company(_current_company, OWNER_NONE);
++        made_towns = GenerateExpansionTowns(towns);
++        made_industries = GenerateExpansionIndustries(industries);
++    }
++    if (before != OriginalTileChecksum(old_width, old_height)) {
++        report = "Original-region tile verification failed. No populated save was written. Reload your input save."; return false;
++    }
++    const auto result = SaveOrLoad(filename, SaveLoadOperation::Save, DetailedFileType::GameFile, Subdirectory::Save, false);
++    report = fmt::format("Created {}/{} towns and {}/{} industries. Original {}x{} tiles unchanged. {}", made_towns, towns, made_industries, industries, old_width, old_height,
++        result == SaveLoadResult::Ok ? "Separate populated save written." : "Save failed; save manually under a new name.");
++    return result == SaveLoadResult::Ok;
++}
+diff --git a/src/map_population.h b/src/map_population.h
+new file mode 100644
+--- /dev/null
++++ b/src/map_population.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef MAP_POPULATION_H
++#define MAP_POPULATION_H
++#include "tile_type.h"
++#include <string>
++extern bool _populating_expansion;
++bool IsExpansionPopulationTile(TileIndex tile);
++TileIndex RandomExpansionPopulationTile();
++uint GenerateExpansionTowns(uint count);
++uint GenerateExpansionIndustries(uint count);
++bool PopulateExpandedMap(uint old_width, uint old_height, uint towns, uint industries, const std::string &filename, std::string &report);
++#endif
+diff --git a/src/pathfinder/follow_track.hpp b/src/pathfinder/follow_track.hpp
+--- a/src/pathfinder/follow_track.hpp
++++ b/src/pathfinder/follow_track.hpp
+@@ -11,6 +11,7 @@
+ #define  FOLLOW_TRACK_HPP
+ 
+ #include "../pbs.h"
++#include "../teleport_gateway.h"
+ #include "../roadveh.h"
+ #include "../station_base.h"
+ #include "../train.h"
+@@ -45,6 +46,7 @@
+ 	DiagDirection       exitdir;       ///< exit direction (leaving the old tile)
+ 	bool                is_tunnel;     ///< last turn passed tunnel
+ 	bool                is_bridge;     ///< last turn passed bridge ramp
++	bool                is_gateway;    ///< Last turn traversed a remote gateway edge.
+ 	bool                is_station;    ///< last turn passed station
+ 	int                 tiles_skipped; ///< number of skipped tunnel or station tiles
+ 	ErrorCode           err;
+@@ -80,6 +82,7 @@
+ 		this->new_tile = INVALID_TILE;
+ 		this->new_td_bits = TRACKDIR_BIT_NONE;
+ 		this->exitdir = DiagDirection::Invalid;
++		this->is_gateway = false;
+ 		this->is_station = false;
+ 		this->is_bridge = false;
+ 		this->is_tunnel = false;
+@@ -166,7 +169,7 @@
+ 
+ 			return false;
+ 		}
+-		if (this->tiles_skipped == 0 && ((!IsRailTT() && !Allow90degTurns()) || (IsRailTT() && Rail90DegTurnDisallowedTilesFromDiagDir(this->old_tile, this->new_tile, this->exitdir, !Allow90degTurns())))) {
++		if (!this->is_gateway && this->tiles_skipped == 0 && ((!IsRailTT() && !Allow90degTurns()) || (IsRailTT() && Rail90DegTurnDisallowedTilesFromDiagDir(this->old_tile, this->new_tile, this->exitdir, !Allow90degTurns())))) {
+ 			this->new_td_bits &= ~TrackdirCrossesTrackdirs(this->old_td);
+ 			if (this->new_td_bits == TRACKDIR_BIT_NONE) {
+ 				this->err = EC_90DEG;
+@@ -210,6 +213,7 @@
+ 	/** Follow the exitdir from old_tile and fill new_tile and tiles_skipped */
+ 	inline void FollowTileExit()
+ 	{
++		this->is_gateway = false;
+ 		this->is_station = false;
+ 		this->is_bridge = false;
+ 		this->is_tunnel = false;
+@@ -232,6 +236,15 @@
+ 			}
+ 			if (!IsRoadCustomBridgeHeadTile(this->old_tile) && !IsRailCustomBridgeHeadTile(this->old_tile)) {
+ 				dbg_assert(ReverseDiagDir(enterdir) == this->exitdir);
++			}
++		}
++
++		if constexpr (Ttr_type_ == TRANSPORT_RAIL) {
++			TileIndex exit = GetTeleportGatewayRouteExit(this->old_tile, this->exitdir, this->veh_owner, this->veh);
++			if (exit != INVALID_TILE) {
++				this->new_tile = exit;
++				this->is_gateway = true;
++				return;
+ 			}
+ 		}
+ 
+@@ -411,7 +424,7 @@
+ 		}
+ 
+ 		/* special handling for rail stations - get to the end of platform */
+-		if (IsRailTT() && this->is_station) {
++		if (IsRailTT() && this->is_station && !IsTeleportGatewayTile(this->new_tile)) {
+ 			/* entered railway station
+ 			 * get platform length */
+ 			uint length = BaseStation::GetByTile(this->new_tile)->GetPlatformLength(this->new_tile, TrackdirToExitdir(this->old_td));
+@@ -444,7 +457,8 @@
+ 				this->tiles_skipped = 0;
+ 				this->is_tunnel = false;
+ 				this->is_bridge = false;
+-				this->is_station = false;
++				this->is_gateway = false;
++		this->is_station = false;
+ 				return true;
+ 			}
+ 		}
+@@ -459,7 +473,8 @@
+ 			this->tiles_skipped = 0;
+ 			this->is_tunnel = false;
+ 			this->is_bridge = false;
+-			this->is_station = false;
++			this->is_gateway = false;
++		this->is_station = false;
+ 			return true;
+ 		}
+ 
+diff --git a/src/pathfinder/yapf/yapf_destrail.hpp b/src/pathfinder/yapf/yapf_destrail.hpp
+--- a/src/pathfinder/yapf/yapf_destrail.hpp
++++ b/src/pathfinder/yapf/yapf_destrail.hpp
+@@ -195,7 +195,7 @@
+ 	/** @copydoc CYapfBaseT::PfCalcEstimateFunc */
+ 	inline bool PfCalcEstimate(Node &n)
+ 	{
+-		if (this->PfDetectDestination(n)) {
++		if (this->PfDetectDestination(n) || IsTeleportGatewayRoutingEnabled()) {
+ 			n.estimate = n.cost;
+ 			return true;
+ 		}
+diff --git a/src/pbs.cpp b/src/pbs.cpp
+--- a/src/pbs.cpp
++++ b/src/pbs.cpp
+@@ -488,6 +488,7 @@
+ 
+ 	/* Do not disallow 90 deg turns as the setting might have changed between reserving and now. */
+ 	CFollowTrackRail ft(o, rts);
++	ft.veh = v;
+ 	auto check_tunnel_bridge = [&]() -> bool {
+ 		if (IsTunnelBridgeWithSignalSimulation(tile) && TrackdirEntersTunnelBridge(tile, trackdir)) {
+ 			if (_settings_game.vehicle.train_braking_model == TBM_REALISTIC && IsTunnelBridgeSignalSimulationEntrance(tile)) {
+diff --git a/src/saveload/saveload.cpp b/src/saveload/saveload.cpp
+--- a/src/saveload/saveload.cpp
++++ b/src/saveload/saveload.cpp
+@@ -612,6 +612,7 @@
+ 	switch (_sl.action) {
+ 		case SLA_SAVE: {
+ 			int64_t x = ReadValue(ptr, conv);
++			if (conv & (1U << 12)) x = RemapExpansionTile(static_cast<uint32_t>(x));
+ 
+ 			/* Write the value to the file and check if its value is in the desired range */
+ 			switch (GetVarFileType(conv)) {
+@@ -1631,7 +1632,7 @@
+ {
+ 	if (!SlIsObjectValidInSavegame(sld)) return false;
+ 
+-	VarType conv = GB(sld.conv, 0, 8);
++	VarType conv = GB(sld.conv, 0, 8) | (sld.conv & (1U << 12));
+ 	switch (sld.cmd) {
+ 		case SL_VAR:
+ 		case SL_REF:
+diff --git a/src/saveload/saveload.h b/src/saveload/saveload.h
+--- a/src/saveload/saveload.h
++++ b/src/saveload/saveload.h
+@@ -11,6 +11,7 @@
+ #define SAVELOAD_H
+ 
+ #include "../sl/saveload_common.h"
++#include "../map_expansion.h"
+ #include "../fileio_type.h"
+ #include "../fios.h"
+ #include "../strings_type.h"
+@@ -453,7 +454,7 @@
+  * @note In general, it is better to use one of the SLE_* macros below.
+  */
+ #define SLE_GENERAL_NAME(cmd, name, base, variable, type, length, from, to, extra) \
+-	SaveLoad {name, cmd, type, length, from, to, { .offset = SlVarWrapper<cmd, type, length, sizeof(base::variable)>(cpp_offsetof(base, variable)) }, nullptr}
++	SaveLoad {name, cmd, static_cast<VarType>(type) | MapExpansionTileFlag<decltype(base::variable)>(), length, from, to, { .offset = SlVarWrapper<cmd, type, length, sizeof(base::variable)>(cpp_offsetof(base, variable)) }, nullptr}
+ 
+ /**
+  * Storage of simple variables, references (pointers), and arrays with a custom name.
+@@ -702,7 +703,7 @@
+  * @note In general, it is better to use one of the SLEG_* macros below.
+  */
+ #define SLEG_GENERAL(name, cmd, variable, type, length, from, to, extra) \
+-	SaveLoad {name, cmd, static_cast<VarType>(type) | static_cast<VarType>(SLF_GLOBAL), length, from, to, { .address = SlVarWrapper<cmd, type, length, sizeof(variable)>(static_cast<void *>(std::addressof(variable))) }, nullptr}
++	SaveLoad {name, cmd, static_cast<VarType>(type) | static_cast<VarType>(SLF_GLOBAL) | MapExpansionTileFlag<decltype(variable)>(), length, from, to, { .address = SlVarWrapper<cmd, type, length, sizeof(variable)>(static_cast<void *>(std::addressof(variable))) }, nullptr}
+ 
+ /**
+  * Storage of a global variable in some savegame versions.
+diff --git a/src/sl/bridge_signal_sl.cpp b/src/sl/bridge_signal_sl.cpp
+--- a/src/sl/bridge_signal_sl.cpp
++++ b/src/sl/bridge_signal_sl.cpp
+@@ -41,7 +41,7 @@
+ 
+ 	for (auto &it : _long_bridge_signal_sim_map) {
+ 		LongBridgeSignalStorage &lbss = it.second;
+-		SlSetArrayIndex(it.first.base());
++		SlSetArrayIndex(RemapExpansionTile(it.first.base()));
+ 		SlObjectSaveFiltered(&lbss, slt);
+ 	}
+ }
+@@ -70,7 +70,7 @@
+ 	SlSetLength(SlGetGammaLength(count) + (count * 4));
+ 	SlWriteSimpleGamma(count);
+ 	for (uint32_t val : _bridge_signal_style_map) {
+-		SlWriteUint32(val);
++		SlWriteUint32((RemapExpansionTile(val >> 4) << 4) | (val & 0xF));
+ 	}
+ }
+ 
+diff --git a/src/sl/extended_ver_sl.cpp b/src/sl/extended_ver_sl.cpp
+--- a/src/sl/extended_ver_sl.cpp
++++ b/src/sl/extended_ver_sl.cpp
+@@ -36,6 +36,7 @@
+  */
+ 
+ #include "../stdafx.h"
++#include "../teleport_gateway.h"
+ #include "../debug.h"
+ #include "saveload.h"
+ #include "saveload_buffer.h"
+@@ -75,6 +76,7 @@
+ static uint32_t saveSTC(const SlxiSubChunkInfo &info, bool dry_run);
+ 
+ const std::initializer_list<SlxiSubChunkInfo> _sl_xv_sub_chunk_infos = {
++	{ XSLFI_TELEPORT_GATEWAY, XSCF_NULL, 2, 2, "teleport_gateway_pairing", nullptr, nullptr, nullptr },
+ 	{ XSLFI_VERSION_LABEL,                    XSCF_IGNORABLE_ALL,       1,   1, "version_label",                    saveVL,  loadVL,  nullptr          },
+ 	{ XSLFI_UPSTREAM_VERSION,                 XSCF_NULL,                2,   2, "upstream_version",                 saveUV,  loadUV,  nullptr          },
+ 	{ XSLFI_TRACE_RESTRICT,                   XSCF_NULL,               23,  23, "tracerestrict",                    nullptr, nullptr, "TRRM,TRRP,TRRS,TRRG,TRRB" },
+@@ -323,6 +325,7 @@
+ 	for (const SlxiSubChunkInfo &info : _sl_xv_sub_chunk_infos) {
+ 		_sl_xv_feature_versions[info.index] = info.save_version;
+ 	}
++	_sl_xv_feature_versions[XSLFI_TELEPORT_GATEWAY] = HasTeleportGatewayState() ? 2 : 0;
+ 	if (Map::SizeX() > 8192 || Map::SizeY() > 8192) {
+ 		_sl_xv_feature_versions[XSLFI_EXTRA_LARGE_MAP] = 1;
+ 	}
+diff --git a/src/sl/extended_ver_sl.h b/src/sl/extended_ver_sl.h
+--- a/src/sl/extended_ver_sl.h
++++ b/src/sl/extended_ver_sl.h
+@@ -207,6 +207,8 @@
+ 	XSLFI_JOKERPP,                                ///< This is a JokerPP game, use this for loading some settings
+ 	XSLFI_CHILLPP,                                ///< This is a ChillPP game, use this for loading some settings
+ 
++	XSLFI_TELEPORT_GATEWAY,                       ///< Gateway pairing identities, version 1
++
+ 	XSLFI_SIZE,                                   ///< Total count of features, including null feature
+ };
+ 
+diff --git a/src/sl/map_sl.cpp b/src/sl/map_sl.cpp
+--- a/src/sl/map_sl.cpp
++++ b/src/sl/map_sl.cpp
+@@ -34,8 +34,8 @@
+ 
+ static void Save_MAPS()
+ {
+-	_map_dim_x = Map::SizeX();
+-	_map_dim_y = Map::SizeY();
++	_map_dim_x = _map_expansion_width ? _map_expansion_width : Map::SizeX();
++	_map_dim_y = _map_expansion_height ? _map_expansion_height : Map::SizeY();
+ 	SlSaveTableObjectChunk(_map_dimensions);
+ }
+ 
+@@ -250,6 +250,7 @@
+ 
+ static void Save_WMAP()
+ {
++	if (_map_expansion_width != 0) { WriteExpandedMapTiles(); return; }
+ 	static_assert(sizeof(Tile) == 8);
+ 	static_assert(sizeof(TileExtended) == 4);
+ 	assert(_sl_xv_feature_versions[XSLFI_WHOLE_MAP_CHUNK] == 2);
+diff --git a/src/sl/saveload.cpp b/src/sl/saveload.cpp
+--- a/src/sl/saveload.cpp
++++ b/src/sl/saveload.cpp
+@@ -1118,7 +1118,7 @@
+ {
+ 	switch (action) {
+ 		case SLA_SAVE: {
+-			SlSaveValue(ReadValue(ptr, conv), conv);
++			SlSaveValue((conv & (1U << 12)) ? RemapExpansionTile(static_cast<uint32_t>(ReadValue(ptr, conv))) : ReadValue(ptr, conv), conv);
+ 			break;
+ 		}
+ 		case SLA_LOAD_CHECK:
+@@ -2090,7 +2090,7 @@
+ {
+ 	void *ptr = GetVariableAddress(object, sld);
+ 
+-	VarType conv = GB(sld.conv, 0, 8);
++	VarType conv = GB(sld.conv, 0, 8) | (sld.conv & (1U << 12));
+ 	switch (sld.cmd) {
+ 		case SL_VAR:
+ 		case SL_REF:
+diff --git a/src/sl/saveload.h b/src/sl/saveload.h
+--- a/src/sl/saveload.h
++++ b/src/sl/saveload.h
+@@ -11,6 +11,7 @@
+ #define SL_SAVELOAD_H
+ 
+ #include "saveload_types.h"
++#include "../map_expansion.h"
+ #include "../fileio_type.h"
+ #include "../fios.h"
+ #include "../strings_type.h"
+@@ -526,7 +527,7 @@
+ 		case SaveLoadCustomContainerOp::Save:
+ 			for (const typename T::value_type &val : *l) {
+ 				if constexpr (SlIsPrimitiveType<typename T::value_type>) {
+-					SlSaveValue(val.base(), conv);
++					SlSaveValue((conv & (1U << 12)) ? RemapExpansionTile(val.base()) : val.base(), conv);
+ 				} else {
+ 					SlSaveValue(val, conv);
+ 				}
+@@ -559,7 +560,7 @@
+  * @param extver   SlXvFeatureTest to test (along with from and to) which savegames have the field
+  * @note In general, it is better to use one of the SLE_* macros below.
+  */
+-#define SLE_GENERAL_X(cmd, base, variable, type, length, from, to, extver) SaveLoad {false, cmd, type, length, from, to, SLTAG_DEFAULT, { .offset = SlVarWrapper<decltype(base::variable), cmd, type, length>(cpp_offsetof(base, variable)) }, { .custom = SlHandlerUnionValue<decltype(base::variable), cmd>() }, extver}
++#define SLE_GENERAL_X(cmd, base, variable, type, length, from, to, extver) SaveLoad {false, cmd, static_cast<VarType>(type) | MapExpansionTileFlag<decltype(base::variable)>(), length, from, to, SLTAG_DEFAULT, { .offset = SlVarWrapper<decltype(base::variable), cmd, type, length>(cpp_offsetof(base, variable)) }, { .custom = SlHandlerUnionValue<decltype(base::variable), cmd>() }, extver}
+ #define SLE_GENERAL(cmd, base, variable, type, length, from, to) SLE_GENERAL_X(cmd, base, variable, type, length, from, to, SlXvFeatureTest())
+ 
+ /**
+@@ -810,7 +811,7 @@
+  * @param extver   SlXvFeatureTest to test (along with from and to) which savegames have the field
+  * @note In general, it is better to use one of the SLEG_* macros below.
+  */
+-#define SLEG_GENERAL_X(cmd, variable, type, length, from, to, extver) SaveLoad {true, cmd, type, length, from, to, SLTAG_DEFAULT, { SlVarWrapper<decltype(variable), cmd, type, length>((void*)&variable) }, { .custom = SlHandlerUnionValue<decltype(variable), cmd>() }, extver}
++#define SLEG_GENERAL_X(cmd, variable, type, length, from, to, extver) SaveLoad {true, cmd, static_cast<VarType>(type) | MapExpansionTileFlag<decltype(variable)>(), length, from, to, SLTAG_DEFAULT, { SlVarWrapper<decltype(variable), cmd, type, length>((void*)&variable) }, { .custom = SlHandlerUnionValue<decltype(variable), cmd>() }, extver}
+ #define SLEG_GENERAL(cmd, variable, type, length, from, to) SLEG_GENERAL_X(cmd, variable, type, length, from, to, SlXvFeatureTest())
+ 
+ /**
+@@ -1070,7 +1071,7 @@
+ void SlSetArrayIndex(uint index);
+ 
+ template <typename T> requires std::is_base_of_v<struct PoolIDBase, T>
+-static void SlSetArrayIndex(const T &index) { SlSetArrayIndex(index.base()); }
++static void SlSetArrayIndex(const T &index) { if constexpr (std::is_same_v<std::remove_cvref_t<T>, TileIndex>) SlSetArrayIndex(RemapExpansionTile(index.base())); else SlSetArrayIndex(index.base()); }
+ 
+ int SlIterateArray();
+ 
+diff --git a/src/sl/saveload_common.h b/src/sl/saveload_common.h
+--- a/src/sl/saveload_common.h
++++ b/src/sl/saveload_common.h
+@@ -11,6 +11,7 @@
+ #define SL_SAVELOAD_COMMON_H
+ 
+ #include "../strings_type.h"
++#include "../map_expansion.h"
+ 
+ template <typename T>
+ concept SlIsPrimitiveType = T::saveload_primitive_type || false;
+@@ -493,7 +494,8 @@
+ inline void SlWriteUint32(const SlIsPrimitiveType auto &data)
+ {
+ 	static_assert(sizeof(decltype(data.base())) <= 4);
+-	SlWriteUint32((uint32_t)data.base());
++	if constexpr (std::is_same_v<std::remove_cvref_t<decltype(data)>, TileIndex>) SlWriteUint32(RemapExpansionTile(data.base()));
++	else SlWriteUint32((uint32_t)data.base());
+ }
+ 
+ void SlSkipBytes(size_t length);
+diff --git a/src/sl/signal_sl.cpp b/src/sl/signal_sl.cpp
+--- a/src/sl/signal_sl.cpp
++++ b/src/sl/signal_sl.cpp
+@@ -35,7 +35,7 @@
+ 
+ static inline void WriteVLI(Buffer &b, TileIndex t)
+ {
+-	WriteVLI(b, t.base());
++	WriteVLI(b, RemapExpansionTile(t.base()));
+ }
+ 
+ static uint ReadVLI()
+diff --git a/src/sl/station_sl.cpp b/src/sl/station_sl.cpp
+--- a/src/sl/station_sl.cpp
++++ b/src/sl/station_sl.cpp
+@@ -590,6 +590,10 @@
+ };
+ 
+ static const NamedSaveLoad _base_station_desc[] = {
++	NSL("teleport_gateway_anchor", SLE_CONDVAR_X(BaseStation, teleport_gateway_anchor, SLE_UINT32, SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_TELEPORT_GATEWAY))),
++	NSL("teleport_gateway_sequence", SLE_CONDVAR_X(BaseStation, teleport_gateway_sequence, SLE_UINT64, SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_TELEPORT_GATEWAY))),
++	NSL("teleport_gateway_partner", SLE_CONDVAR_X(BaseStation, teleport_gateway_partner, SLE_UINT16, SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_TELEPORT_GATEWAY))),
++	NSL("teleport_gateway_partner_sequence", SLE_CONDVAR_X(BaseStation, teleport_gateway_partner_sequence, SLE_UINT64, SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_TELEPORT_GATEWAY))),
+ 	NSL("xy",                                     SLE_VAR(BaseStation, xy,                        SLE_UINT32)),
+ 	NSL("town",                                   SLE_REF(BaseStation, town,                      REF_TOWN)),
+ 	NSL("string_id",                              SLE_VAR(BaseStation, string_id,                 SLE_STRINGID)),
+diff --git a/src/sl/tracerestrict_sl.cpp b/src/sl/tracerestrict_sl.cpp
+--- a/src/sl/tracerestrict_sl.cpp
++++ b/src/sl/tracerestrict_sl.cpp
+@@ -14,6 +14,7 @@
+ #include "../string_func.h"
+ #include "saveload.h"
+ #include <vector>
++#include "../scope.h"
+ 
+ static const NamedSaveLoad _trace_restrict_mapping_desc[] = {
+ 	NSL("program_id", SLE_VAR(TraceRestrictMappingItem, program_id, SLE_UINT32)),
+@@ -41,7 +42,7 @@
+ 	SaveLoadTableData slt = SlTableHeader(_trace_restrict_mapping_desc);
+ 
+ 	for (auto &it : _tracerestrictprogram_mapping) {
+-		SlSetArrayIndex(it.first);
++		SlSetArrayIndex((RemapExpansionTile(it.first >> 3) << 3) | (it.first & 7));
+ 		TraceRestrictMappingItem &item = it.second;
+ 		SlObjectSaveFiltered(&item, slt);
+ 	}
+@@ -158,7 +159,13 @@
+ 
+ 	for (TraceRestrictProgram *prog : TraceRestrictProgram::Iterate()) {
+ 		SlSetArrayIndex(prog->index);
+-		SlObjectSaveFiltered(prog, slt);
++        auto original_items = prog->items;
++        auto restore = scope_guard([&] { prog->items = std::move(original_items); });
++        if (_map_expansion_width != 0) for (auto iter : prog->IterateInstructionsMutable()) {
++            auto property = GetTraceRestrictTypeProperties(iter.Instruction());
++            if (property.value_type == TRVT_TILE_INDEX || property.value_type == TRVT_TILE_INDEX_THROUGH) iter.SecondaryRef() = RemapExpansionTile(iter.Secondary());
++        }
++        SlObjectSaveFiltered(prog, slt);
+ 	}
+ }
+ 
+diff --git a/src/sl/vehicle_sl.cpp b/src/sl/vehicle_sl.cpp
+--- a/src/sl/vehicle_sl.cpp
++++ b/src/sl/vehicle_sl.cpp
+@@ -1195,6 +1195,8 @@
+ 	};
+ 
+ 	static const NamedSaveLoad _train_desc[] = {
++		NSL("teleport_gateway_passages", SLE_CONDVAR_X(Train, teleport_gateway_passages, SLE_UINT32, SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_TELEPORT_GATEWAY, 2))),
++		NSL("teleport_gateway_exit", SLE_CONDVAR_X(Train, teleport_gateway_exit, SLE_UINT32, SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_TELEPORT_GATEWAY, 2))),
+ 		NSL("", SLE_WRITEBYTE(Vehicle, type)),
+ 		NSL("", SLE_INCLUDE(IncludeBaseVehicleDescription)),
+ 		NSLT_STRUCT<VehicleCommonStructHandler>("common"),
+diff --git a/src/station_cmd.cpp b/src/station_cmd.cpp
+--- a/src/station_cmd.cpp
++++ b/src/station_cmd.cpp
+@@ -8,6 +8,7 @@
+ /** @file station_cmd.cpp Handling of station tiles. */
+ 
+ #include "stdafx.h"
++#include "teleport_gateway.h"
+ #include "aircraft.h"
+ #include "bridge_map.h"
+ #include "viewport_func.h"
+@@ -933,6 +934,8 @@
+ 		this->RecomputeCatchment();
+ 	}
+ 
++	if (type == StationType::Rail) RefreshTeleportGatewayPairs();
++
+ }
+ 
+ CommandCost ClearTile_Station(TileIndex tile, DoCommandFlags flags);
+@@ -4093,6 +4096,7 @@
+ /** @copydoc VehicleEnterTileProc */
+ static VehicleEnterTileStates VehicleEnterTile_Station(Vehicle *v, TileIndex tile, int x, int y)
+ {
++	if (v->type == VehicleType::Train && IsTeleportGatewayTile(tile)) return {};
+ 	if (v->type == VehicleType::Train) {
+ 		Train *t = Train::From(v);
+ 		Train *consist = t->First();
+@@ -4754,6 +4758,7 @@
+ 
+ void OnTick_Station()
+ {
++	if (_tick_counter % 64 == 0) RefreshTeleportGatewayPairs();
+ 	if (_game_mode == GameMode::Editor) return;
+ 
+ 	ClearDeleteStaleLinksVehicleCache();
+diff --git a/src/teleport_gateway.cpp b/src/teleport_gateway.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/teleport_gateway.cpp
+@@ -0,0 +1,108 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include "stdafx.h"
++#include "teleport_gateway.h"
++#include "teleport_gateway_policy.h"
++#include "station_base.h"
++#include "newgrf_station.h"
++#include "station_map.h"
++#include "map_func.h"
++#include "train.h"
++#include "newgrf_config.h"
++#include "pathfinder/yapf/yapf_cache.h"
++#include "safeguards.h"
++
++bool IsTeleportGatewayTile(TileIndex tile)
++{
++    if (!IsValidTile(tile) || !IsRailStationTile(tile)) return false;
++    const StationSpec *spec = GetStationSpec(tile);
++    return spec != nullptr && spec->grf_prop.grfid == TELEPORT_GATEWAY_GRFID && spec->grf_prop.local_id == 0;
++}
++
++static TileIndex FindSingleGateway(const Station *station)
++{
++    // Most stations have no gateway spec; avoid scanning their rail areas.
++    bool has_gateway_spec = false;
++    for (const auto &mapping : station->speclist) {
++        if (mapping.grfid == TELEPORT_GATEWAY_GRFID && mapping.spec != nullptr &&
++                mapping.spec->grf_prop.local_id == 0) { has_gateway_spec = true; break; }
++    }
++    if (!has_gateway_spec) return INVALID_TILE;
++    TileIndex result = INVALID_TILE;
++    for (TileIndex tile : station->train_station) {
++        if (!IsTeleportGatewayTile(tile) || GetStationIndex(tile) != station->index) continue;
++        if (result != INVALID_TILE) return INVALID_TILE; // Multiple gateways in one joined station are ambiguous.
++        result = tile;
++    }
++    return result;
++}
++
++void RefreshTeleportGatewayPairs()
++{
++    std::vector<TeleportGateway::Endpoint> endpoints;
++    for (Station *station : Station::Iterate()) {
++        TileIndex anchor = FindSingleGateway(station);
++        if (anchor == INVALID_TILE || anchor != station->teleport_gateway_anchor) {
++            station->teleport_gateway_sequence = 0;
++            station->teleport_gateway_partner = TeleportGateway::UNPAIRED;
++            station->teleport_gateway_partner_sequence = 0;
++        }
++        station->teleport_gateway_anchor = anchor;
++        if (anchor == INVALID_TILE) continue;
++        endpoints.push_back({station->index.base(), station->owner.base(),
++            station->teleport_gateway_sequence, station->teleport_gateway_partner,
++            station->teleport_gateway_partner_sequence});
++    }
++    TeleportGateway::Reconcile(endpoints);
++    bool changed = false;
++    for (const auto &e : endpoints) {
++        Station *station = Station::Get(StationID{e.id});
++        changed |= station->teleport_gateway_partner != e.partner || station->teleport_gateway_sequence != e.sequence;
++        station->teleport_gateway_sequence = e.sequence;
++        station->teleport_gateway_partner = e.partner;
++        station->teleport_gateway_partner_sequence = e.partner_sequence;
++    }
++    if (changed) CSegmentCostCacheBase::NotifyTrackLayoutChange();
++}
++
++TileIndex GetTeleportGatewayPartner(TileIndex tile, Owner owner)
++{
++    if (!IsTeleportGatewayTile(tile)) return INVALID_TILE;
++    const Station *station = Station::GetByTile(tile);
++    if (station->owner != owner || station->teleport_gateway_anchor != tile ||
++            station->teleport_gateway_partner == TeleportGateway::UNPAIRED) return INVALID_TILE;
++    const Station *partner = Station::GetIfValid(StationID{station->teleport_gateway_partner});
++    if (partner == nullptr || partner->owner != owner ||
++            partner->teleport_gateway_partner != station->index.base() ||
++            partner->teleport_gateway_sequence != station->teleport_gateway_partner_sequence ||
++            partner->teleport_gateway_partner_sequence != station->teleport_gateway_sequence ||
++            !IsTeleportGatewayTile(partner->teleport_gateway_anchor) ||
++            GetStationIndex(partner->teleport_gateway_anchor) != partner->index) return INVALID_TILE;
++    return partner->teleport_gateway_anchor;
++}
++
++/** Saves without registered gateways need no custom save feature. */
++bool HasTeleportGatewayState()
++{
++    for (const Station *station : Station::Iterate()) {
++        if (station->teleport_gateway_anchor != INVALID_TILE || station->teleport_gateway_sequence != 0) return true;
++    }
++    return false;
++}
++
++TileIndex GetTeleportGatewayRouteExit(TileIndex tile, DiagDirection direction, Owner owner, const Train *train)
++{
++    if (_settings_game.vehicle.train_braking_model == TBM_REALISTIC) return INVALID_TILE;
++    if (train != nullptr && train->First()->teleport_gateway_exit == tile) return INVALID_TILE;
++    if (!IsTeleportGatewayTile(tile)) return INVALID_TILE;
++    TileIndex partner = GetTeleportGatewayPartner(tile, owner);
++    if (partner == INVALID_TILE || GetRailStationAxis(tile) != GetRailStationAxis(partner) ||
++            DiagDirToAxis(direction) != GetRailStationAxis(tile)) return INVALID_TILE;
++    return TileAddByDiagDir(partner, direction);
++}
++
++bool IsTeleportGatewayRoutingEnabled()
++{
++    // GRF lookup is bounded by the small active-GRF list, unlike scanning all
++    // stations for every search node. It is valid during load as well as ticks.
++    return _settings_game.vehicle.train_braking_model != TBM_REALISTIC && GetGRFConfig(TELEPORT_GATEWAY_GRFID) != nullptr;
++}
+diff --git a/src/teleport_gateway.h b/src/teleport_gateway.h
+new file mode 100644
+--- /dev/null
++++ b/src/teleport_gateway.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef TELEPORT_GATEWAY_H
++#define TELEPORT_GATEWAY_H
++#include "tile_type.h"
++#include "company_type.h"
++#include "station_type.h"
++#include "direction_type.h"
++/** Wire-order GRFID for NML's "TGW\\01". */
++constexpr uint32_t TELEPORT_GATEWAY_GRFID = 0x01574754;
++struct Train;
++/** Physical next tile reached after a remote gateway edge, or INVALID_TILE. */
++TileIndex GetTeleportGatewayRouteExit(TileIndex tile, DiagDirection direction, Owner owner, const Train *train);
++
++bool IsTeleportGatewayTile(TileIndex tile);
++void RefreshTeleportGatewayPairs();
++bool HasTeleportGatewayState();
++bool IsTeleportGatewayRoutingEnabled();
++/** Returns INVALID_TILE for unpaired, deleted, ambiguous or foreign gateways. */
++TileIndex GetTeleportGatewayPartner(TileIndex tile, Owner owner);
++#endif
+diff --git a/src/teleport_gateway_policy.h b/src/teleport_gateway_policy.h
+new file mode 100644
+--- /dev/null
++++ b/src/teleport_gateway_policy.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/** Independent, deterministic gateway pairing policy. No train relocation. */
++#ifndef TELEPORT_GATEWAY_POLICY_H
++#define TELEPORT_GATEWAY_POLICY_H
++#include <algorithm>
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++namespace TeleportGateway {
++constexpr uint16_t UNPAIRED = 0xFFFF;
++struct Endpoint {
++    uint16_t id;
++    uint8_t owner;
++    uint64_t sequence;
++    uint16_t partner;
++    uint64_t partner_sequence;
++};
++/** Preserve reciprocal same-owner links, then pair oldest waiting endpoints. */
++inline void Reconcile(std::vector<Endpoint> &endpoints)
++{
++    std::sort(endpoints.begin(), endpoints.end(), [](const auto &a, const auto &b) { return a.id < b.id; });
++    uint64_t next = 0;
++    for (const auto &e : endpoints) next = std::max(next, e.sequence);
++    auto find = [&](uint16_t id) -> Endpoint * {
++        auto it = std::lower_bound(endpoints.begin(), endpoints.end(), id,
++            [](const auto &e, uint16_t id) { return e.id < id; });
++        return it != endpoints.end() && it->id == id ? &*it : nullptr;
++    };
++    // Validate all links against the original state before mutating either end.
++    std::vector<bool> valid(endpoints.size());
++    for (size_t i = 0; i < endpoints.size(); ++i) {
++        const auto &e = endpoints[i];
++        const auto *p = find(e.partner);
++        valid[i] = e.sequence != 0 && p != nullptr && p != &e && p->sequence != 0 &&
++            p->owner == e.owner && p->partner == e.id && e.partner_sequence == p->sequence &&
++            p->partner_sequence == e.sequence;
++    }
++    for (size_t i = 0; i < endpoints.size(); ++i) {
++        auto &e = endpoints[i];
++        if (!valid[i]) { e.partner = UNPAIRED; e.partner_sequence = 0; }
++        if (e.sequence == 0) {
++            if (next == std::numeric_limits<uint64_t>::max()) throw std::overflow_error("Gateway creation sequence exhausted");
++            e.sequence = ++next;
++        }
++    }
++    std::vector<Endpoint *> waiting;
++    for (auto &e : endpoints) if (e.partner == UNPAIRED) waiting.push_back(&e);
++    std::sort(waiting.begin(), waiting.end(), [](const auto *a, const auto *b) {
++        return a->sequence != b->sequence ? a->sequence < b->sequence : a->id < b->id;
++    });
++    // Owner buckets prevent links between independent companies.
++    Endpoint *first[256]{};
++    for (auto *e : waiting) {
++        auto *&p = first[e->owner];
++        if (p == nullptr) { p = e; continue; }
++        p->partner = e->id; p->partner_sequence = e->sequence;
++        e->partner = p->id; e->partner_sequence = p->sequence;
++        p = nullptr;
++    }
++}
++} // namespace TeleportGateway
++#endif
+diff --git a/src/tilearea_type.h b/src/tilearea_type.h
+--- a/src/tilearea_type.h
++++ b/src/tilearea_type.h
+@@ -9,6 +9,8 @@
+ 
+ #ifndef TILEAREA_TYPE_H
+ #define TILEAREA_TYPE_H
++
++#include <iterator>
+ 
+ #include "stdafx.h"
+ #include INCLUDE_FOR_PREFETCH_NTA
+diff --git a/src/timer/timer_manager.h b/src/timer/timer_manager.h
+--- a/src/timer/timer_manager.h
++++ b/src/timer/timer_manager.h
+@@ -12,6 +12,8 @@
+ 
+ #ifndef TIMER_MANAGER_H
+ #define TIMER_MANAGER_H
++
++#include <vector>
+ 
+ #include "../3rdparty/cpp-btree/btree_set.h"
+ 
+diff --git a/src/town_cmd.cpp b/src/town_cmd.cpp
+--- a/src/town_cmd.cpp
++++ b/src/town_cmd.cpp
+@@ -8,6 +8,7 @@
+ /** @file town_cmd.cpp Handling of town tiles. */
+ 
+ #include "stdafx.h"
++#include "map_population.h"
+ #include "misc/history_type.hpp"
+ #include "misc/history_func.hpp"
+ #include "road.h"
+@@ -1349,6 +1350,7 @@
+  */
+ static bool GrowTownWithBridge(const Town *t, const TileIndex tile, const DiagDirection bridge_dir)
+ {
++	if (_populating_expansion) return false;
+ 	assert(bridge_dir < DiagDirection::End);
+ 
+ 	if (!t->GetAllowBuildBridges()) return false;
+@@ -1459,6 +1461,7 @@
+  */
+ static bool GrowTownWithTunnel(const Town *t, const TileIndex tile, const DiagDirection tunnel_dir)
+ {
++	if (_populating_expansion) return false;
+ 	assert(tunnel_dir < DiagDirection::End);
+ 
+ 	const TownTunnelMode tunnel_mode = t->GetBuildTunnelMode();
+@@ -1607,6 +1610,7 @@
+ {
+ 	RoadBits rcmd{}; // RoadBits for the road construction command
+ 	TileIndex tile = *tile_ptr; // The main tile on which we base our growth
++	if (!IsExpansionPopulationTile(tile)) return TownGrowthResult::SearchStopped;
+ 
+ 	assert(tile < Map::Size());
+ 
+@@ -2889,6 +2893,7 @@
+  */
+ static inline CommandCost CanBuildHouseHere(TileIndex tile, TownID town, CanBuildHouseHereFlags flags)
+ {
++	if (!IsExpansionPopulationTile(tile)) return CMD_ERROR;
+ 	/* cannot build on these slopes... */
+ 	if (flags.Test(CanBuildHouseHereFlag::NoSlope)) {
+ 		if (!IsTileFlat(tile)) return CommandCost(STR_ERROR_FLAT_LAND_REQUIRED);
+@@ -3009,6 +3014,7 @@
+  */
+ static inline bool TownLayoutAllowsHouseHere(Town *t, const TileArea &ta, TownExpandModes modes)
+ {
++	for (TileIndex tile : ta) if (!IsExpansionPopulationTile(tile)) return false;
+ 	if (!modes.Test(TownExpandMode::Buildings)) return false;
+ 
+ 	/* Allow towns everywhere when we don't build roads */
+@@ -4812,3 +4818,27 @@
+ {
+ 	return _town_draw_tile_data;
+ }
++
++uint GenerateExpansionTowns(uint count)
++{
++    TownNames names;
++    for (const Town *t : Town::Iterate()) names.insert(std::string{t->GetCachedName()});
++    uint made = 0;
++    for (uint i = 0; i < count; ++i) {
++        uint32_t parts;
++        if (!GenerateTownName(_random, &parts, &names)) continue;
++        const bool city = _settings_game.economy.larger_towns != 0 && i % _settings_game.economy.larger_towns == 0;
++        for (uint attempt = 0; attempt < 100; ++attempt) {
++            if (!Town::CanAllocateItem()) break;
++            TileIndex tile = RandomExpansionPopulationTile();
++            if (tile == INVALID_TILE || TownCanBePlacedHere(tile, city, true).Failed()) continue;
++            AutoRestoreBackup owner(_current_company, OWNER_TOWN);
++            Town *t = Town::Create(tile);
++            DoCreateTown(t, tile, parts, TSZ_RANDOM, city, _settings_game.economy.town_layout, false);
++            if (t->cache.population > 0) { ++made; break; }
++            Command<Commands::DeleteTown>::Do(DoCommandFlag::Execute, t->index);
++        }
++    }
++    RebuildTownKdtree();
++    return made;
++}
+diff --git a/src/train.h b/src/train.h
+--- a/src/train.h
++++ b/src/train.h
+@@ -155,6 +155,8 @@
+  * 'Train' is either a loco or a wagon.
+  */
+ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
++	uint32_t teleport_gateway_passages = 0; ///< Persistent prototype passage counter.
++	TileIndex teleport_gateway_exit = INVALID_TILE; ///< Suppress immediate return jump while leaving the destination gateway.
+ 	TrackBits track{}; ///< On which track the train currently is.
+ 	VehicleRailFlags flags{};
+ 	TrainCache tcache{};
+diff --git a/src/train_cmd.cpp b/src/train_cmd.cpp
+--- a/src/train_cmd.cpp
++++ b/src/train_cmd.cpp
+@@ -8,6 +8,7 @@
+ /** @file train_cmd.cpp Handling of trains. */
+ 
+ #include "stdafx.h"
++#include "teleport_gateway.h"
+ #include "error.h"
+ #include "articulated_vehicles.h"
+ #include "command_func.h"
+@@ -3463,7 +3464,7 @@
+ 	if (consist->current_order.IsType(OT_WAITING)) return;
+ 
+ 	/* Exit if we are on a station tile and are going to stop. */
+-	if (HasStationTileRail(moving_front->tile) && consist->current_order.ShouldStopAtStation(consist, GetStationIndex(moving_front->tile), IsRailWaypoint(moving_front->tile))) return;
++	if (!IsTeleportGatewayTile(moving_front->tile) && HasStationTileRail(moving_front->tile) && consist->current_order.ShouldStopAtStation(consist, GetStationIndex(moving_front->tile), IsRailWaypoint(moving_front->tile))) return;
+ 
+ 	switch (consist->current_order.GetType()) {
+ 		/* Exit if we reached our destination depot. */
+@@ -4918,6 +4919,8 @@
+ 	} else {
+ 		new_tile = TileAddByDiagDir(origin.tile, exitdir);
+ 	}
++	TileIndex gateway_exit = GetTeleportGatewayRouteExit(origin.tile, exitdir, consist->owner, consist);
++	if (gateway_exit != INVALID_TILE) new_tile = gateway_exit;
+ 	TrackBits reachable = TrackdirBitsToTrackBits(GetTileTrackdirBits(new_tile, TRANSPORT_RAIL, 0) & DiagdirReachesTrackdirs(exitdir));
+ 
+ 	if (Rail90DegTurnDisallowedTilesFromDiagDir(origin.tile, new_tile, exitdir)) reachable &= ~TrackCrossesTracks(TrackdirToTrack(origin.trackdir));
+@@ -5741,6 +5744,140 @@
+  * @param reverse Set to false to not execute the vehicle reversing. This does not change any other logic.
+  * @return True if the vehicle could be moved forward, false otherwise.
+  */
++/** Restricted prototype: atomically relocate a straight consist onto a clear,
++ * same-axis destination corridor. 0 = not a gateway, 1 = wait, 2 = transferred.
++ * Physical buffers are required at both ends; realistic braking is not yet supported.
++ */
++static uint TryTeleportStraightTrain(Train *consist)
++{
++    Train *front = consist->GetMovingFront();
++    const TileIndex source = front->tile;
++    auto wait = [&](const char *reason) { if (consist->tick_counter % 8 == 0) Debug(misc, 0, "Gateway wait train {} reason {}", consist->index.base(), reason); return 1U; };
++    if (!IsTeleportGatewayTile(source) || consist->teleport_gateway_exit == source) return 0;
++    const TileIndex target = GetTeleportGatewayPartner(source, consist->owner);
++    if (target == INVALID_TILE || consist->UsingRealisticBraking() ||
++            GetRailStationAxis(source) != GetRailStationAxis(target)) return wait("layout/footprint");
++    const Axis axis = GetRailStationAxis(source);
++    const Track track = AxisToTrack(axis);
++    const TrackBits trackbits = TrackToTrackBits(track);
++    const RailType railtype = GetTileRailType(source);
++    if (front->track != trackbits || GetTileRailType(target) != railtype) return wait("layout/footprint");
++    const Direction direction = front->GetMovingDirection();
++    const int dx = (static_cast<int>(TileX(target)) - static_cast<int>(TileX(source))) * TILE_SIZE;
++    const int dy = (static_cast<int>(TileY(target)) - static_cast<int>(TileY(source))) * TILE_SIZE;
++    const int source_z = GetSlopePixelZ(front->x_pos, front->y_pos, true);
++    const int target_z = GetSlopePixelZ(front->x_pos + dx, front->y_pos + dy, true);
++    std::vector<TileIndex> old_tiles;
++    uint min_x = Map::SizeX(), min_y = Map::SizeY(), max_x = 0, max_y = 0;
++    for (Train *u = consist; u != nullptr; u = u->Next()) {
++        if (u->track != trackbits || u->GetMovingDirection() != direction ||
++                u->vehstatus.Test(VehState::Crashed) || GetTileSlope(u->tile) != SLOPE_FLAT ||
++                GetSlopePixelZ(u->x_pos, u->y_pos, true) != source_z) return wait("layout/footprint");
++        const int nx = u->x_pos + dx, ny = u->y_pos + dy;
++        if (nx < 0 || ny < 0 || nx >= static_cast<int>(Map::SizeX() * TILE_SIZE) || ny >= static_cast<int>(Map::SizeY() * TILE_SIZE)) return wait("layout/footprint");
++        const TileIndex tile = TileVirtXY(nx, ny);
++        min_x = std::min(min_x, TileX(tile)); max_x = std::max(max_x, TileX(tile));
++        min_y = std::min(min_y, TileY(tile)); max_y = std::max(max_y, TileY(tile));
++        old_tiles.push_back(u->tile);
++    }
++    // One spare tile at each end covers vehicle bodies beyond centre coordinates.
++    if (axis == Axis::X) { if (min_x == 0 || max_x + 1 >= Map::SizeX()) return wait("layout/footprint"); --min_x; ++max_x; }
++    else { if (min_y == 0 || max_y + 1 >= Map::SizeY()) return wait("layout/footprint"); --min_y; ++max_y; }
++    std::vector<TileIndex> target_tiles;
++    for (uint y = min_y; y <= max_y; ++y) for (uint x = min_x; x <= max_x; ++x) {
++        const TileIndex tile = TileXY(x, y);
++        if (!IsValidTile(tile) || GetTileOwner(tile) != consist->owner ||
++                GetTileSlope(tile) != SLOPE_FLAT || GetTileRailType(tile) != railtype ||
++                GetSlopePixelZ(x * TILE_SIZE + 8, y * TILE_SIZE + 8, true) != target_z) return wait("layout/footprint");
++        if (tile == target) {
++            if (!IsTeleportGatewayTile(tile)) return wait("layout/footprint");
++        } else if (!IsPlainRailTile(tile) || GetTrackBits(tile) != trackbits || HasSignals(tile)) return wait("layout/footprint");
++        // Reject even our own vehicles: overlapping source/destination buffers
++        // are not a supported layout in this first prototype.
++        if (HasVehicleOnTile<VehicleType::Train>(tile, [](const Train *) { return true; })) return wait("layout/footprint");
++        target_tiles.push_back(tile);
++    }
++    // Drop our forward reservation first, so it cannot be mistaken for a foreign
++    // reservation on the remote exit. Occupied source tracks remain protected.
++    FreeTrainTrackReservation(consist);
++    std::vector<TileIndex> acquired;
++    const DiagDirection exitdir = VehicleExitDir(direction, trackbits);
++    const int forward_sign = (exitdir == DiagDirection::SW || exitdir == DiagDirection::SE) ? 1 : -1;
++    const int target_front_coord = axis == Axis::X ? TileX(target) : TileY(target);
++    for (TileIndex tile : target_tiles) {
++        const int coord = axis == Axis::X ? TileX(tile) : TileY(tile);
++        if ((coord - target_front_coord) * forward_sign > 0) {
++            // The leading body margin must be free, but do not pre-reserve it:
++            // that could merge our temporary footprint with someone else's path.
++            if (GetReservedTrackbits(tile) != TRACK_BIT_NONE) {
++                for (TileIndex reserved : acquired) UnreserveRailTrack(reserved, track);
++                return wait("forward margin reservation");
++            }
++            continue;
++        }
++        if (!TryReserveRailTrack(tile, track)) {
++            for (TileIndex reserved : acquired) UnreserveRailTrack(reserved, track);
++            return wait("destination reservation");
++        }
++        acquired.push_back(tile);
++    }
++    auto shift = [&](int sx, int sy) {
++        consist->MarkDirty();
++        for (Train *u = consist; u != nullptr; u = u->Next()) {
++            u->x_pos += sx; u->y_pos += sy;
++            u->tile = TileVirtXY(u->x_pos, u->y_pos);
++            u->z_pos = GetSlopePixelZ(u->x_pos, u->y_pos, true);
++            u->UpdatePosition();
++            u->UpdateInclination(true, false, false);
++        }
++        consist->MarkDirty();
++    };
++    const uint16_t speed = consist->cur_speed;
++    const uint8_t subspeed = consist->subspeed;
++    shift(dx, dy);
++    consist->teleport_gateway_exit = target;
++    CSegmentCostCacheBase::NotifyTrackLayoutChange();
++    consist->lookahead.reset();
++    // Native PBS must establish a safe route beyond the temporary footprint.
++    if (!TryPathReserve(consist, false, true)) {
++        // Failed native path reservation rolls back its own tentative path.
++        // Release only our explicitly acquired footprint; never walk a foreign path.
++        for (TileIndex tile : acquired) UnreserveRailTrack(tile, track);
++        shift(-dx, -dy);
++        consist->teleport_gateway_exit = INVALID_TILE;
++        CSegmentCostCacheBase::NotifyTrackLayoutChange();
++        consist->cur_speed = speed; consist->subspeed = subspeed;
++        for (TileIndex tile : old_tiles) TryReserveRailTrack(tile, track);
++        return wait("exit path reservation");
++    }
++    std::sort(old_tiles.begin(), old_tiles.end());
++    old_tiles.erase(std::unique(old_tiles.begin(), old_tiles.end()), old_tiles.end());
++    for (TileIndex tile : old_tiles) {
++        UnreserveRailTrack(tile, track);
++        UpdateSignalsOnSegment(tile, VehicleExitDir(direction, trackbits), consist->owner);
++        UpdateSignalsOnSegment(tile, ReverseDiagDir(VehicleExitDir(direction, trackbits)), consist->owner);
++        MarkTileDirtyByTile(tile);
++    }
++    // Extra buffer tiles outside the relocated consist must not retain orphan
++    // reservations. Keep only occupied tiles and the native forward route.
++    const int front_coord = axis == Axis::X ? TileX(front->tile) : TileY(front->tile);
++    for (TileIndex tile : acquired) {
++        const int coord = axis == Axis::X ? TileX(tile) : TileY(tile);
++        if ((coord - front_coord) * forward_sign <= 0 &&
++                !HasVehicleOnTile<VehicleType::Train>(tile, [consist](const Train *u) { return u->First() == consist; })) UnreserveRailTrack(tile, track);
++    }
++    consist->cur_speed = speed; consist->subspeed = subspeed;
++    consist->flags.Reset(VehicleRailFlag::Stuck);
++    consist->reverse_distance = 0;
++    TriggerStationAnimation(Station::GetByTile(source), source, StationAnimationTrigger::VehicleArrives);
++    TriggerStationAnimation(Station::GetByTile(target), target, StationAnimationTrigger::VehicleArrives);
++    UpdateSignalsOnSegment(target, VehicleExitDir(direction, trackbits), consist->owner);
++    UpdateSignalsOnSegment(target, ReverseDiagDir(VehicleExitDir(direction, trackbits)), consist->owner);
++    ++consist->teleport_gateway_passages;
++    Debug(misc, 0, "Gateway transfer train {} source {} target {} parts preserved", consist->index.base(), source.base(), target.base());
++    return 2;
++}
++
+ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
+ {
+ 	Train *first = v->First();
+@@ -5776,6 +5913,15 @@
+ 
+ 
+ 		GetNewVehiclePosResult gp = GetNewVehiclePos(v);
++		if (v->IsMovingFront() && gp.old_tile != gp.new_tile && !(v->track & TRACK_BIT_WORMHOLE)) {
++			uint transfer = TryTeleportStraightTrain(first);
++			if (transfer == 2) return true;
++			if (transfer == 1) {
++				first->cur_speed = 0; first->subspeed = 0; first->progress = 255;
++				return false;
++			}
++		}
++
+ 		if (!(v->track & TRACK_BIT_WORMHOLE) && gp.old_tile != gp.new_tile &&
+ 				IsRailBridgeHeadTile(gp.old_tile) && DiagdirBetweenTiles(gp.old_tile, gp.new_tile) == GetTunnelBridgeDirection(gp.old_tile)) {
+ 			/* left a bridge headtile into a wormhole */
+@@ -6042,6 +6188,7 @@
+ 					if (v->GetMovingNext() == nullptr && !(v->track & TRACK_BIT_WORMHOLE)) ClearPathReservation(v, v->tile, v->GetVehicleTrackdir(), true);
+ 
+ 					v->tile = gp.new_tile;
++					if (v->IsMovingFront() && gp.old_tile == first->teleport_gateway_exit) { first->teleport_gateway_exit = INVALID_TILE; CSegmentCostCacheBase::NotifyTrackLayoutChange(); }
+ 					v->track = chosen_track;
+ 					dbg_assert(v->track);
+ 
+@@ -6731,6 +6878,8 @@
+ 
+ 	DiagDirection dir = VehicleExitDir(moving_front->GetMovingDirection(), moving_front->track);
+ 	TileIndex tile = moving_front->tile + TileOffsByDiagDir(dir);
++	TileIndex gateway_exit = GetTeleportGatewayRouteExit(moving_front->tile, dir, moving_front->owner, moving_front->First());
++	if (gateway_exit != INVALID_TILE) tile = gateway_exit;
+ 
+ 	/* not a crossing || wrong axis || unusable rail (wrong type or owner) */
+ 	if (!IsLevelCrossingTile(tile) || DiagDirToAxis(dir) == GetCrossingRoadAxis(tile) ||
+@@ -6765,6 +6914,8 @@
+ 	DiagDirection dir = VehicleExitDir(moving_front->GetMovingDirection(), moving_front->track);
+ 	/* Calculate next tile */
+ 	TileIndex tile = moving_front->tile + TileOffsByDiagDir(dir);
++	TileIndex gateway_exit = GetTeleportGatewayRouteExit(moving_front->tile, dir, consist->owner, consist);
++	if (gateway_exit != INVALID_TILE) tile = gateway_exit;
+ 
+ 	/* Determine the track status on the next tile */
+ 	TrackStatus ts = GetTileTrackStatus(tile, TRANSPORT_RAIL, RoadTramType::Invalid, ReverseDiagDir(dir));
